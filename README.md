@@ -1,8 +1,10 @@
 # 🌿 PlantHabitatMonitor
 > **The Electro-Natural Plant Tech Sensor Menagerie**
 
-[![Platform](https://img.shields.io)](https://docs.particle.io)
-[![Project](https://img.shields.io)](https://www.hackster.io)
+[![Hackster.io](https://img.shields.io)](https://www.hackster.io)
+
+[![Particle](https://img.shields.io)](https://docs.particle.io)
+
 
 ---
 
@@ -152,8 +154,8 @@ Piezo Atomizer Detail
 Cloud Dashboard  
 (images/adafruit_Dashboard.png)
 
-Final Habitat  (to be updated)
-(images/Finished_gravel_dish_for_air_plants.png)
+Final Habitat  (updated as project progresses)
+(images/PlantHabitatMonitor03.png)
 
 ······························
 
