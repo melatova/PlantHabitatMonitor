@@ -1,9 +1,13 @@
 # 🌿 PlantHabitatMonitor
 > **The Electro-Natural Plant Tech Sensor Menagerie**
 
-[![Hackster.io](https://img.shields.io)](https://www.hackster.io)
+[![Hackster Project](https://img.shields.io/badge/Hackster-Project-blue)](https://www.hackster.io/melatova/smart-tillandsia-care-a-multi-tiered-air-plant-sanctuary-8053e7)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Particle%20Photon%202-lightgrey)]()
+[![For-the-badge](https://img.shields.io/badge/grow-glow-brightgreen?labelColor=green&color=grey)]()
 
-[![Particle](https://img.shields.io)](https://docs.particle.io)
+
+
 
 ---
 
