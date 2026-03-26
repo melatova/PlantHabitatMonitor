@@ -1,0 +1,115 @@
+Plant Habitat Monitor Project 
+
+---------------------------------------------------------
+
+Take care of a plant and see how it's doing!
+
+
+
+
+ ─────────────────────────────────────────────
+   Hardware:
+ ─────────────────────────────────────────────
+
+
+
+     Device OS  : 5.8.0  (best for NeoPixels on Photon 2)
+     NeoPixel   : D2, WS2812B, 24 LEDs (2x12 rings)
+     BME280     : I2C 0x76
+     OLED       : SSD1306 128x64, I2C 0x3C
+     Soil sensor: A0 (capacitive)
+     Air quality: A1 (Grove MP-503)
+     Pump relay : D4
+     Mist relay : D5
+     Mode button: D9  (long=AUTO/MANUAL, short=advance OLED page)
+     Mist button: D7  (dedicated tap for manual mist burst)
+ ─────────────────────────────────────────────
+   See plant data and control mister and pump
+
+	Adafruit Dashboard Feeds
+ ─────────────────────────────────────────────
+
+
+     PUBLISH  -> temperature, humidity, plant-status,
+                airreading, mode
+     SUBSCRIBE<- pumponoff, misteronoff, pumpslider,
+                modetoggle
+
+
+ ─────────────────────────────────────────────
+   Determine when habitat needs water
+
+		THRESHOLDS
+ ─────────────────────────────────────────────
+
+  Calibration notes: air=3392, wet soil=3335, dry soil=3360, water=1460
+  Air plants in gravel will sit closer to the dry end
+
+SOIL_DRY_VALUE    = 3200;
+SOIL_WET_VALUE    = 1500;
+SOIL_WATER_THRESH = 30% below -> auto-water
+
+MIST_TEMP_THRESH  = 30.0;    deg C above -> consider misting
+MIST_HUM_THRESH   = 25.0;    %RH below  -> auto-mist fires
+
+
+─────────────────────────────────────────────
+   Display with environmental information
+
+		OLED PAGES
+─────────────────────────────────────────────
+	
+	PAGE_PLANT
+	PAGE_CLIMATE
+	PAGE_DEVICES
+	PAGE_MODE
+	"WATERING!" screen if pump is running
+	"MISTING!"  screen while misting
+
+starts with PAGE_PLANT
+
+ ─────────────────────────────────────────────
+   Continuously check plant environment
+
+		LOOP
+ ─────────────────────────────────────────────
+
+	Sensor read every 10 s
+
+	If in Auto Mode, waters plant if dry
+
+	Keeps MQTT connection alive
+   
+	Publishes every 30 min
+
+	Scrolls through OLED pages via 
+
+	Shows Watering and Misting pages when activated
+ 
+	Lights up neoPixels
+
+  ─────────────────────────────────────────────
+   Get readings from various sensors
+
+		SENSOR READS
+  ─────────────────────────────────────────────
+	Converts soil moisture to percent
+	Converts temperature to Farenheit
+	Determines air quality from the readings
+
+    tempC     = bme.readTemperature();
+    humidRH   = bme.readHumidity();
+    tempF     = tempC * 1.8 + 32;
+    pressPA   = bme.readPressure();
+    pressInHg = 0.0002953 * pressPA;
+    soilRaw   = analogRead(SOIL_MOISTURE_PIN);
+    soilPct   = mapSoilToPercent(soilRaw);
+    airReading = airSensor.getValue();
+    airQuality = airSensor.slope();
+
+
+
+
+
+
+
