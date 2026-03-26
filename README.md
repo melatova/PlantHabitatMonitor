@@ -5,7 +5,6 @@
 
 [![Particle](https://img.shields.io)](https://docs.particle.io)
 
-
 ---
 
 ### 🍃 Smart Tillandsia Care 
