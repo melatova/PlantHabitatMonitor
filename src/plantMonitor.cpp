@@ -199,7 +199,11 @@ void startMister();
 void stopMister();
 void updateNeoPixel();
 int  mapSoilToPercent(int raw);
+void drawDisplay(String timeDateLabel); // Function to draw the OLED display with moisture level and time-stamp
 String getAirQualityLabel(int val);
+String timeStamp(); // Function to get the current time and date as a string for the time-stamp
+String timeOnly; // Variable to store the current date and time
+
 
 // ─────────────────────────────────────────────
 //  SETUP
@@ -248,8 +252,6 @@ void setup() {
     Particle.syncTime();
     drawDisplay(timeOnly); // Draw the initial display with label and time-stamp
     display.display();
-
-}
 
     // -- Air quality sensor ------------------------
     if (airSensor.init()) {
@@ -865,7 +867,7 @@ void drawDisplay(String timeOnly) {
   display.setCursor(0,0); // Set cursor to top-left corner
   display.println("Moisture Level:"); // Print label for moisture level
   display.setCursor(0,10); // Move cursor down to next line
-  display.print(moistureLevel); // Print moisture level to OLED display
+  display.print(soilPct); // Print moisture level to OLED display
   display.setCursor(0,20); // Move cursor down to next line
   display.print(timeOnly); // Print time and date label
   display.display(); // Update the display with the new moisture level  
