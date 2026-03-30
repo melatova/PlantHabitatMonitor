@@ -1,28 +1,29 @@
 // ============================================================
-//  Project :   Plant Habitat Monitor
-//  Author  :   Nicole 
-//           
-//  Date    :   3/26/2026
+//  Project     :  Plant Habitat Monitor
+//  Author      :  Nicole
+//  Date        :  2/20/26  (updated 3/30)
+//  Description :  Smart plant monitor — auto watering + misting,
+//                 two DIY resistive moisture sensors, manual buttons,
+//                 Adafruit IO dashboard, OLED display, NeoPixel ring.
 //
 //  Hardware confirmed working:
 //    Device OS  : 5.8.0  (best for NeoPixels on Photon 2)
-//    NeoPixel   : D2, WS2812B, 24 LEDs (2x12 rings)
+//    NeoPixel   : SPI1,  WS2812B, 12 LEDs (1 × 12-LED ring)
 //    BME280     : I2C 0x76
-//    OLED       : SSD1306 128x64, I2C 0x3C
-//    Soil sensor: A0 (capacitive)
+//    OLED       : SSD1306 128×64, I2C 0x3C
+//    Gravel sensor  : A5 (power pulse), A0 (analog read)  threshold 500–1500
+//    Reservoir sensor: D8 (power pulse), A2 (analog read)  threshold 500
 //    Air quality: A1 (Grove MP-503)
-//    Pump relay : D4
-//    Mist relay : D5
-//    Mode button: D9  (short=next OLED page, long=AUTO/MANUAL toggle)
-//    Mist button: D7  (short=mist burst, long=pump cycle)
+//    Pump MOSFET: D4
+//    Mist MOSFET: D5
+//    Mode button: D9  (short = next OLED page, long = AUTO/MANUAL toggle)
+//    Mist button: D7  (short = mist burst,     long = pump cycle)
 //
 //  Adafruit IO feeds:
-//    PUBLISH  -> temperature, humidity, plant-status,
-//               airreading, mode
+//    PUBLISH  -> temperature, humidity, plant-status, airreading, mode
 //    SUBSCRIBE<- pumponoff, misteronoff, modetoggle
 //
-//  Future improvements: resevoir level sensor, sms alert if system needs attention, OLED graphics
-//
+//  Future: reservoir level feed, SMS alert, OLED bitmap graphics
 // ============================================================
 
 #include "Particle.h"
@@ -38,46 +39,65 @@
 #include "Colors.h"
 #include "Air_Quality_Sensor.h"
 
-//#gfxDisplay.h //future home for OLED bitmaps!
-
 // SYSTEM_THREAD(ENABLED) moves WiFi/cloud to a background thread
 // so loop() never freezes waiting for network events.
 SYSTEM_MODE(SEMI_AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
 // ─────────────────────────────────────────────
-//  PIN ASSIGNMENTS  (function first, then "Pin")
+//  PIN ASSIGNMENTS
 // ─────────────────────────────────────────────
-const int SOIL_MOISTURE_PIN = A0;
-const int AIR_QUALITY_PIN   = A1;
-const int PUMP_PIN          = D4;
-const int MIST_PIN          = D5;
-const int MODE_BUTTON_PIN   = D9;
-const int MIST_BUTTON_PIN   = D7;
-// NeoPixel data -> D2 (confirmed working, Device OS 5.8.0)
+// Gravel dish sensor (air plants) — resistive, pulsed to prevent electrolysis
+const int GRAVEL_POWER_PIN    = A5;  // OUTPUT — pulse HIGH to read
+const int GRAVEL_ANALOG_PIN   = A0;  // INPUT  — analog read
+
+// Water reservoir sensor — same resistive pulsed technique
+const int RESERVOIR_POWER_PIN = D8;  // OUTPUT — pulse HIGH to read
+const int RESERVOIR_ANALOG_PIN = A2; // INPUT  — analog read
+
+const int AIR_QUALITY_PIN     = A1;  // Grove MP-503 analog out
+const int PUMP_PIN            = D4;  // MOSFET gate — pump
+const int MIST_PIN            = D5;  // MOSFET gate — TD-002 mister
+const int MODE_BUTTON_PIN     = D9;  // INPUT_PULLUP — short/long press
+const int MIST_BUTTON_PIN     = D7;  // INPUT_PULLUP — short/long press
+// NeoPixel data -> SPI1 (confirmed working, Device OS 5.8.0)
 
 // ─────────────────────────────────────────────
-//  THRESHOLDS
+//  THRESHOLDS  (calibrated to sensors)
 // ─────────────────────────────────────────────
-const int   SOIL_DRY_VALUE    = 3500; //from 3200
-const int   SOIL_WET_VALUE    = 1500;
-// Calibration: air=3392, wet soil=3335, dry soil=3360, water=1460
-// Air plants in gravel sit near the dry end -- these values are solid.
-const int   SOIL_WATER_THRESH = 30;    // % below -> auto-water
 
-const float MIST_TEMP_THRESH  = 30.0;  // deg C above -> consider misting
-const float MIST_HUM_THRESH   = 25.0;  // %RH below  -> auto-mist fires
+// Gravel dish (air plants):
+//   Calibration: dry gravel ~100-300, wet gravel ~1000+
+//   Hysteresis: turn pump ON below 500, OFF above 1500
+const int GRAVEL_ON_THRESH    = 500;   // below this -> auto-water
+const int GRAVEL_OFF_THRESH   = 1500;  // above this -> stop pump
+                                        // (wide hysteresis avoids chatter)
 
+// Reservoir:
+//   Probes immersed: reading > 500 = water present
+//   Probes in air:   reading < 500 = reservoir low
+const int RESERVOIR_THRESH    = 500;   // below -> reservoir low alert
+
+// Auto-misting (BME280 driven)
+const float MIST_TEMP_THRESH  = 30.0;  // °C above -> consider misting
+const float MIST_HUM_THRESH   = 25.0;  // %RH below -> auto-mist fires
+
+// Actuator timings
 const unsigned long PUMP_RUN_MS      = 5000;   // 5 s per water cycle
-const unsigned long PUMP_COOLDOWN_MS = 60000;  // 60 s min between pump cycles
+const unsigned long PUMP_COOLDOWN_MS = 60000;  // 60 s min between cycles
 const unsigned long MIST_RUN_MS      = 3000;   // 3 s per mist burst
 const unsigned long MODE_LOCK_MS     = 5000;   // dashboard can't override button for 5 s
+const unsigned long MIN_PUMP_ON_MS   = 3000;   // minimum pump ON time
+
+// Hysteresis thresholds (used in autoWateringLogic)
+const int SOIL_ON_THRESH      = GRAVEL_ON_THRESH;
+const int SOIL_OFF_THRESH     = GRAVEL_OFF_THRESH;
 
 // ─────────────────────────────────────────────
-//  TIMING  (millis-based -- no blocking delays)
+//  TIMING  (millis-based)
 // ─────────────────────────────────────────────
 const unsigned long SENSOR_INTERVAL_MS = 10000;
-const unsigned long MQTT_INTERVAL_MS   = 1800000; // 30 min
+const unsigned long MQTT_INTERVAL_MS   = 1800000; // 30 min 
 const unsigned long NEO_INTERVAL_MS    = 100;
 const unsigned long OLED_PAGE_MS       = 5000;
 
@@ -86,31 +106,31 @@ unsigned long lastMqttMs               = 0;
 unsigned long lastNeoMs                = 0;
 unsigned long lastOledMs               = 0;
 unsigned long pumpStartMs              = 0;
-unsigned long pumpStopMs               = 0;   // cooldown reference
+unsigned long pumpStopMs               = 0;
 unsigned long mistStartMs              = 0;
-unsigned long lastPhysicalModeChangeMs = 0;   // mode-lock reference
+unsigned long lastPhysicalModeChangeMs = 0;
 
 // ─────────────────────────────────────────────
-//  NEOPIXEL
+//  NEOPIXEL  (single 12-LED ring via SPI1)
 // ─────────────────────────────────────────────
-const int PIXEL_COUNT = 24;   // 2 x 12-LED rings daisy-chained
-Adafruit_NeoPixel pixel(PIXEL_COUNT, SPI1); //format to appease neoPixel.h constructor
+const int PIXEL_COUNT = 12;
+Adafruit_NeoPixel pixel(PIXEL_COUNT, SPI1, WS2812B);
 int sizeArray = sizeof(rainbow) / sizeof(rainbow[0]);
 
 // ─────────────────────────────────────────────
 //  HARDWARE OBJECTS
 // ─────────────────────────────────────────────
-const int OLED_RESET = -1;   // no hardware reset pin
-Adafruit_SSD1306 display(OLED_RESET);
-Adafruit_BME280  bme;
-AirQualitySensor airSensor(AIR_QUALITY_PIN);
+const int OLED_RESET = -1;
+Adafruit_SSD1306  display(OLED_RESET);
+Adafruit_BME280   bme;
+AirQualitySensor  airSensor(AIR_QUALITY_PIN);
 
 // ─────────────────────────────────────────────
 //  MQTT
 // ─────────────────────────────────────────────
 TCPClient           TheClient;
 Adafruit_MQTT_SPARK mqtt(&TheClient, AIO_SERVER, AIO_SERVERPORT,
-                         AIO_USERNAME, AIO_KEY);
+                          AIO_USERNAME, AIO_KEY);
 
 Adafruit_MQTT_Publish feedTemperature (&mqtt, AIO_USERNAME "/feeds/temperature");
 Adafruit_MQTT_Publish feedHumidity    (&mqtt, AIO_USERNAME "/feeds/humidity");
@@ -126,7 +146,9 @@ Adafruit_MQTT_Subscribe subModeToggle (&mqtt, AIO_USERNAME "/feeds/modetoggle");
 //  SENSOR DATA
 // ─────────────────────────────────────────────
 float tempC = 0, tempF = 0, pressPA = 0, pressInHg = 0, humidRH = 0;
-int   soilRaw = 0, soilPct = 0;
+int   gravelRaw = 0;        // raw ADC from gravel dish sensor
+int   reservoirRaw = 0;     // raw ADC from reservoir sensor
+bool  reservoirLow = false; // true when reservoir needs refill
 float airReading = 0;
 int   airQuality = 0;
 
@@ -142,68 +164,65 @@ bool alertSentThisCycle = false;
 //  OLED PAGE STATE MACHINE
 //
 //  Normal cycle (auto-advances every 5 s, or short-press D9):
-//    PAGE_PLANT   -- plant happy/dry + soil % + humidity
+//    PAGE_BOOT    -- title + timestamp (shown once at startup)
+//    PAGE_PLANT   -- gravel moisture + humidity
 //    PAGE_CLIMATE -- temp F + air quality + pressure
-//    PAGE_DEVICES -- mister + pump status
+//    PAGE_DEVICES -- mister + pump + reservoir status
 //    PAGE_MODE    -- AUTO / MANUAL watering mode
 //
-//  Interrupt pages (override normal cycle while active):
+//  Interrupt pages (override while active):
 //    pumpRunning   -> "WATERING!" screen
 //    misterRunning -> "MISTING!"  screen
-//    pump takes priority if both are somehow active
 //
-//  GRAPHICS UPGRADE PATH:
-//  Text layout is live. Bitmap blocks sit commented out directly
-//  below each case -- swap text block for bitmap block when ready.
-//  Confirmed bitmaps in gfxDisplay.h:
+//  GRAPHICS:
+//  Next step, add in bitmaps.
+//  Finished bitmaps in gfxDisplay.h:
 //    BITMAP_TEMP_F, BITMAP_BAROMETER, BITMAP_RH_PERCENT
 //  Still to create:
 //    BITMAP_PLANT_HAPPY, BITMAP_PLANT_DRY
 //    BITMAP_MIST, BITMAP_PUMP, BITMAP_AUTO, BITMAP_MANUAL
 // ─────────────────────────────────────────────
 enum OledPage {
-    PAGE_PLANT   = 0,
-    PAGE_CLIMATE = 1,
-    PAGE_DEVICES = 2,
-    PAGE_MODE    = 3,
-    PAGE_COUNT   = 4
+    PAGE_BOOT    = 0,
+    PAGE_PLANT   = 1,
+    PAGE_CLIMATE = 2,
+    PAGE_DEVICES = 3,
+    PAGE_MODE    = 4,
+    PAGE_COUNT   = 5
 };
-int currentPage = PAGE_PLANT;
+int currentPage = PAGE_BOOT;
 
 // ─────────────────────────────────────────────
 //  BUTTON DEBOUNCE STATE
 // ─────────────────────────────────────────────
-bool          lastModeButtonState = HIGH;
+int           lastModeButtonState = HIGH;
 unsigned long modeButtonPressMs   = 0;
-bool          lastMistButtonState = HIGH;
+int           lastMistButtonState = HIGH;
 unsigned long mistButtonPressMs   = 0;
 const int     DEBOUNCE_MS         = 50;
 
 // ─────────────────────────────────────────────
 //  FORWARD DECLARATIONS
 // ─────────────────────────────────────────────
-void MQTT_connect();
-bool MQTT_ping();
-void readSensors();
-void drawOledPage();
-void advancePage();
-void handleModeButton();
-void handleMistButton();
-void handleSubscriptions();
-void publishToAdafruitIO();
-void autoWateringLogic();
-void autoMistingLogic();
-void startPump();
-void stopPump();
-void startMister();
-void stopMister();
-void updateNeoPixel();
-int  mapSoilToPercent(int raw);
-void drawDisplay(String timeDateLabel); // Function to draw the OLED display with moisture level and time-stamp
+void  MQTT_connect();
+bool  MQTT_ping();
+void  readSensors();
+int   readResistiveSensor(int powerPin, int analogPin);
+void  drawOledPage();
+void  advancePage();
+void  handleModeButton();
+void  handleMistButton();
+void  handleSubscriptions();
+void  publishToAdafruitIO();
+void  autoWateringLogic();
+void  autoMistingLogic();
+void  startPump();
+void  stopPump();
+void  startMister();
+void  stopMister();
+void  updateNeoPixel();
 String getAirQualityLabel(int val);
-String timeStamp(); // Function to get the current time and date as a string for the time-stamp
-String timeOnly; // Variable to store the current date and time
-
+String getTimeStamp();
 
 // ─────────────────────────────────────────────
 //  SETUP
@@ -214,27 +233,31 @@ void setup() {
     Serial.println("Plant Monitor booting...");
 
     // -- GPIO --------------------------------------
-    pinMode(PUMP_PIN,        OUTPUT); digitalWrite(PUMP_PIN, LOW);
-    pinMode(MIST_PIN,        OUTPUT); digitalWrite(MIST_PIN, LOW);
-    pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(MIST_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(PUMP_PIN,             OUTPUT); digitalWrite(PUMP_PIN, LOW);
+    pinMode(MIST_PIN,             OUTPUT); digitalWrite(MIST_PIN, LOW);
+    pinMode(MODE_BUTTON_PIN,      INPUT_PULLUP);
+    pinMode(MIST_BUTTON_PIN,      INPUT_PULLUP);
+    pinMode(GRAVEL_POWER_PIN,     OUTPUT); digitalWrite(GRAVEL_POWER_PIN, LOW);
+    pinMode(GRAVEL_ANALOG_PIN,    INPUT);
+    pinMode(RESERVOIR_POWER_PIN,  OUTPUT); digitalWrite(RESERVOIR_POWER_PIN, LOW);
+    pinMode(RESERVOIR_ANALOG_PIN, INPUT);
 
-    // Suppress onboard RGB -- prevents interference with NeoPixel
+    // Suppress onboard RGB — prevents interference with NeoPixel SPI
     RGB.control(true);
     RGB.color(0, 0, 0);
 
     // -- NeoPixel ----------------------------------
     pixel.begin();
     pixel.setBrightness(50);
+    pixel.setPixelColor(0, pixel.Color(0, 160, 140)); // single teal pixel on boot
     pixel.show();
     Serial.println("NeoPixel OK");
 
-    // -- I2C -- must come before BME280 and OLED --
+    // -- I2C — must come before BME280 and OLED ---
     Wire.begin();
 
     // -- BME280 ------------------------------------
-    bool status = bme.begin(0x76);
-    if (!status) {
+    if (!bme.begin(0x76)) {
         Serial.println("BME280 not found at 0x76 -- check wiring");
     } else {
         Serial.println("BME280 OK");
@@ -247,11 +270,24 @@ void setup() {
     display.clearDisplay();
     display.display();
     Serial.println("OLED OK");
-    timeOnly = timeStamp(); // Get the current time and date for the initial time-stamp
-    Time.zone(-6); // Set the time zone to Mountain Time (UTC-7) for accurate time-stamping (adjust for daylight savings time)
-    Particle.syncTime();
-    drawDisplay(timeOnly); // Draw the initial display with label and time-stamp
-    display.display();
+
+    // -- WiFi + Particle cloud ---------------------
+    // waitFor() gives each step a time limit then continues regardless.
+    WiFi.on();
+    WiFi.connect();
+    waitFor(WiFi.ready, 15000);
+    if (WiFi.ready()) {
+        Serial.println("WiFi connected");
+        Particle.connect();
+        waitFor(Particle.connected, 10000);
+        if (Particle.connected()) {
+            Particle.syncTime();
+            Time.zone(-6); // Mountain Time — adjust +1 for MDT (summer)
+            Serial.println("Particle cloud connected — time synced");
+        }
+    } else {
+        Serial.println("WiFi timeout -- continuing offline");
+    }
 
     // -- Air quality sensor ------------------------
     if (airSensor.init()) {
@@ -265,89 +301,80 @@ void setup() {
     mqtt.subscribe(&subMistButton);
     mqtt.subscribe(&subModeToggle);
 
-    // -- WiFi + Particle cloud ---------------------
-    // waitFor() gives each step a time limit then continues regardless.
-    // Device keeps working offline if WiFi is unavailable.
-    WiFi.on();
-    WiFi.connect();
-    waitFor(WiFi.ready, 15000);
-    if (WiFi.ready()) {
-        Serial.println("WiFi connected");
-        Particle.connect();
-        waitFor(Particle.connected, 10000);
-        if (Particle.connected()) {
-            Particle.syncTime();
-            Serial.println("Particle cloud connected");
-        }
-    } else {
-        Serial.println("WiFi timeout -- continuing offline");
-    }
+    // -- Boot OLED page — show title + timestamp ---
+    // Displayed once at startup before cycling begins
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(4, 2);  display.print("Plant");
+    display.setCursor(4, 22); display.print("Monitor");
+    display.setTextSize(1);
+    display.setCursor(4, 46); display.print("for happy plants");
+    display.setCursor(4, 56); display.print(getTimeStamp());
+    display.display();
+    Serial.printf("Boot time: %s\n", getTimeStamp().c_str());
 
-    // Seed timers so first sensor read fires immediately on boot
-    lastSensorMs = millis() - SENSOR_INTERVAL_MS + 3000;
+    // Seed timers
+    lastSensorMs = millis() - SENSOR_INTERVAL_MS + 3000; // first read in 3 s
     lastMqttMs   = millis();
     lastNeoMs    = millis();
     lastOledMs   = millis();
-    pumpStopMs   = millis() - PUMP_COOLDOWN_MS;  // pump ready immediately
+    pumpStopMs   = millis() - PUMP_COOLDOWN_MS; // pump ready immediately
 
     Serial.println("Plant Monitor ready!");
-/* 
-    delay(5000);        //for easy testing
-    digitalWrite(PUMP_PIN, HIGH);
-    delay(5000);
-    digitalWrite(PUMP_PIN, LOW);
-    delay(5000); */
 }
 
 // ─────────────────────────────────────────────
 //  LOOP
-//  Traffic controller -- checks everything quickly, delegates.
-//  Nothing here blocks (no delay, no while loops).
+//  Traffic controller — delegates, never blocks.
 // ─────────────────────────────────────────────
 void loop() {
     unsigned long now = millis();
-    // -- Sensor read every 10 s --------------------
+
+    // Sensor read every 10 s — auto logic runs ONLY after fresh data.
+    // Keeping auto logic here prevents it from re-evaluating stale
+    // gravelRaw thousands of times per second, which caused the pump
+    // to restart immediately after stopping before the next real read.
     if (now - lastSensorMs >= SENSOR_INTERVAL_MS) {
         lastSensorMs = now;
         readSensors();
-    //    if (modeAuto) {
-     //       autoWateringLogic();
-      //      autoMistingLogic();
-        //}
+        if (modeAuto) {
+            autoWateringLogic();
+            autoMistingLogic();
+        }
     }
-     if (modeAuto) {
-          autoWateringLogic();
-          autoMistingLogic();
-     }
 
-    // -- Auto-off: pump and mister -----------------
+    // Auto-off: pump and mister — checked every loop for accurate timing.
+    // These use millis() elapsed time, not sensor data, so they are safe
+    // to check continuously without causing the re-trigger problem above.
     if (pumpRunning   && (now - pumpStartMs >= PUMP_RUN_MS)) stopPump();
     if (misterRunning && (now - mistStartMs >= MIST_RUN_MS)) stopMister();
 
-    // -- Buttons -----------------------------------
+    // Buttons
     handleModeButton();
     handleMistButton();
 
-    // -- MQTT keep-alive ---------------------------
+    // MQTT keep-alive + subscriptions
     MQTT_connect();
     MQTT_ping();
-    mqtt.processPackets(10);  // listen for incoming subscriptions, 10ms window
+    mqtt.processPackets(10);
     handleSubscriptions();
 
-    // -- Publish every 30 min ----------------------
+    // Publish every 30 min
     if (now - lastMqttMs >= MQTT_INTERVAL_MS) {
         lastMqttMs = now;
         publishToAdafruitIO();
     }
 
-    // -- OLED: auto-advance page every 5 s ---------
+    // OLED: auto-advance page every 5 s (skip boot page after first cycle)
     if (now - lastOledMs >= OLED_PAGE_MS) {
         lastOledMs = now;
-        if (!pumpRunning && !misterRunning) advancePage();
+        if (!pumpRunning && !misterRunning) {
+            advancePage();
+        }
     }
     drawOledPage();
 
-    // -- NeoPixel animation tick -------------------
+    // NeoPixel animation tick
     if (now - lastNeoMs >= NEO_INTERVAL_MS) {
         lastNeoMs = now;
         updateNeoPixel();
@@ -355,43 +382,56 @@ void loop() {
 }
 
 // ─────────────────────────────────────────────
-//  SENSOR READS
+//  RESISTIVE SENSOR READ  (shared helper btw both sensors)
 //
+//  Both DIY sensors use the same technique:
+//    1. Pulse power pin HIGH for 20ms — enough to get a stable read
+//    2. Read the analog voltage
+//    3. Pull power LOW immediately — prevents electrolysis on the wires
+//
+//  Dry / no water : high resistance → little current → low ADC
+//  Wet / has water : low resistance → more current → higher ADC
+//  (opposite of capacitive sensor — no inversion needed)
+// ─────────────────────────────────────────────
+int readResistiveSensor(int powerPin, int analogPin) {
+    digitalWrite(powerPin, HIGH);
+    delay(20);                      // 20 ms stabilisation pulse
+    int val = analogRead(analogPin);
+    digitalWrite(powerPin, LOW);
+    return val;
+}
+
+// ─────────────────────────────────────────────
+//  SENSOR READS
 // ─────────────────────────────────────────────
 void readSensors() {
+    // BME280
     tempC     = bme.readTemperature();
     humidRH   = bme.readHumidity();
-    tempF     = tempC * 1.8 + 32;
+    tempF     = tempC * 1.8 + 32.0;
     pressPA   = bme.readPressure();
     pressInHg = 0.0002953 * pressPA;
 
-    soilRaw = analogRead(SOIL_MOISTURE_PIN);
-    if (soilRaw >= 4090) {
-        // 4095 = floating pin (sensor unplugged or water-damaged)
-        // Return early -- don't update soilPct, don't trigger auto-logic
-        Serial.println("[SOIL] sensor disconnected -- skipping");
-        return;
-    }
-    soilPct = mapSoilToPercent(soilRaw);
+    // Gravel dish sensor (air plants)
+    gravelRaw = readResistiveSensor(GRAVEL_POWER_PIN, GRAVEL_ANALOG_PIN);
 
+    // Reservoir water level sensor
+    reservoirRaw = readResistiveSensor(RESERVOIR_POWER_PIN, RESERVOIR_ANALOG_PIN);
+    reservoirLow = (reservoirRaw < RESERVOIR_THRESH);
+
+    // Air quality
     airReading = airSensor.getValue();
     airQuality = airSensor.slope();
 
-    Serial.printf("[BME]  %.1fF  %.1f%%RH  %.2f inHg\n", tempF, humidRH, pressInHg);
-    Serial.printf("[SOIL] raw=%d  %d%%\n", soilRaw, soilPct);
-    Serial.printf("[AIR]  %.1f  %s\n", airReading, getAirQualityLabel(airQuality).c_str());
+    Serial.printf("[BME]   %.1fF  %.1f%%RH  %.2f inHg\n", tempF, humidRH, pressInHg);
+    Serial.printf("[GRVL]  raw=%d  %s\n", gravelRaw,
+                  gravelRaw >= GRAVEL_ON_THRESH ? "moist" : "dry");
+    Serial.printf("[RESV]  raw=%d  %s\n", reservoirRaw,
+                  reservoirLow ? "LOW" : "OK");
+    Serial.printf("[AIR]   %.1f  %s\n", airReading,
+                  getAirQualityLabel(airQuality).c_str());
 }
 
-// mapSoilToPercent: constrain() clamps to known range,
-// map() stretches that range to 0-100%.
-int mapSoilToPercent(int raw) {
-    raw = constrain(raw, SOIL_WET_VALUE, SOIL_DRY_VALUE);
-    return map(raw, SOIL_DRY_VALUE, SOIL_WET_VALUE, 0, 100);
-}
-
-// :: is the scope resolution operator -- "look inside AirQualitySensor
-// for the constant named FRESH_AIR". Like opening a specific drawer
-// in a specific cabinet.
 String getAirQualityLabel(int val) {
     if (val == AirQualitySensor::FRESH_AIR)     return "Good";
     if (val == AirQualitySensor::LOW_POLLUTION)  return "Fair";
@@ -401,39 +441,57 @@ String getAirQualityLabel(int val) {
 }
 
 // ─────────────────────────────────────────────
+//  TIMESTAMP
+//
+//  Returns current time as "HH:MM:SS" string.
+//  Uses Particle.syncTime() called in setup()
+//  Daylight savings for Time.zone():
+//  Time.zone(-6) = MST.  Use -7 for MDT (summer).
+// ─────────────────────────────────────────────
+String getTimeStamp() {
+    String dateTime = Time.timeStr();
+    return dateTime.substring(11, 19); // extract HH:MM:SS
+}
+
+// ─────────────────────────────────────────────
 //  OLED STATE MACHINE
 // ─────────────────────────────────────────────
-
-// % wraps currentPage like a clock: 0,1,2,3,0,1,2,3...
 void advancePage() {
-    currentPage = (currentPage + 1) % PAGE_COUNT;
+    // Boot page shows once, then skips into normal cycle
+    if (currentPage == PAGE_BOOT) {
+        currentPage = PAGE_PLANT;
+    } else {
+        // Cycle PAGE_PLANT -> PAGE_CLIMATE -> PAGE_DEVICES -> PAGE_MODE -> back
+        currentPage = PAGE_PLANT + (currentPage - PAGE_PLANT + 1) % (PAGE_COUNT - 1);
+    }
 }
 
 void drawOledPage() {
     display.clearDisplay();
 
-    // Interrupt pages override normal cycle.
-    // Pump takes priority over mist if both somehow active.
+    // Interrupt pages — pump takes priority over mist
     if (pumpRunning) {
         display.setTextSize(2);
-        display.setCursor(10, 8);  display.print("WATERING!");
+        display.setCursor(10, 4);  display.print("WATERING!");
         display.setTextSize(1);
-        display.setCursor(10, 40); display.print("Auto-pump running");
-        display.setCursor(10, 52); display.printf("Soil: %d%%", soilPct);
-        // -- BITMAP VERSION --
+        display.setCursor(10, 36); display.print("Auto-pump running");
+        display.setCursor(10, 48); display.printf("Gravel: %d", gravelRaw);
+        display.setCursor(10, 56); display.print(getTimeStamp());
+        // -- BITMAP VERSION (uncomment when ready) --
         // display.drawBitmap(44, 4, BITMAP_PUMP, 40, 40, WHITE);
         // display.setTextSize(1);
-        // display.setCursor(10, 50); display.printf("Soil: %d%%", soilPct);
+        // display.setCursor(10, 50); display.printf("Gravel: %d", gravelRaw);
         display.display();
         return;
     }
 
     if (misterRunning) {
         display.setTextSize(2);
-        display.setCursor(10, 8);  display.print("MISTING!");
+        display.setCursor(10, 4);  display.print("MISTING!");
         display.setTextSize(1);
-        display.setCursor(10, 40); display.print("Mist cycle active");
-        display.setCursor(10, 52); display.printf("Humid: %.0f%%", humidRH);
+        display.setCursor(10, 36); display.print("Mist cycle active");
+        display.setCursor(10, 48); display.printf("Humid: %.0f%%", humidRH);
+        display.setCursor(10, 56); display.print(getTimeStamp());
         // -- BITMAP VERSION --
         // display.drawBitmap(44, 4, BITMAP_MIST, 40, 40, WHITE);
         // display.setTextSize(1);
@@ -444,20 +502,34 @@ void drawOledPage() {
 
     switch (currentPage) {
 
+        case PAGE_BOOT: {
+            // Boot page — title card + timestamp
+            // Stays up until first 5-second cycle or button press
+            display.setTextSize(2);
+            display.setCursor(4, 2);  display.print("Plant");
+            display.setCursor(4, 22); display.print("Monitor");
+            display.setTextSize(1);
+            display.setCursor(4, 46); display.print("Nicole  CNM IoT");
+            display.setCursor(4, 56); display.print(getTimeStamp());
+            break;
+        }
+
         case PAGE_PLANT: {
-            bool happy = (soilPct >= SOIL_WATER_THRESH);
+            // Gravel moisture + humidity
+            bool happy = (gravelRaw >= GRAVEL_ON_THRESH);
             display.setTextSize(2);
             display.setCursor(8, 4);
             display.print(happy ? ":) Happy" : ":( Dry!");
             display.setTextSize(1);
-            display.setCursor(8, 36); display.printf("Soil:  %d%%", soilPct);
-            display.setCursor(8, 50); display.printf("Humid: %.0f%%", humidRH);
+            display.setCursor(8, 36); display.printf("Gravel:%4d", gravelRaw);
+            display.setCursor(8, 48); display.printf("Humid: %.0f%%", humidRH);
+            display.setCursor(8, 56); display.print(getTimeStamp());
             // -- BITMAP VERSION --
             // const unsigned char* bmp = happy ? BITMAP_PLANT_HAPPY : BITMAP_PLANT_DRY;
             // display.drawBitmap(4, 12, bmp, 40, 40, WHITE);
             // display.setTextSize(1);
-            // display.setCursor(50, 16); display.printf("Soil  %d%%", soilPct);
-            // display.setCursor(50, 32); display.printf("Hum   %.0f%%", humidRH);
+            // display.setCursor(50, 16); display.printf("Gravel %d", gravelRaw);
+            // display.setCursor(50, 32); display.printf("Hum  %.0f%%", humidRH);
             // display.setCursor(50, 48); display.print(happy ? "Happy!" : "Needs water!");
             break;
         }
@@ -466,11 +538,13 @@ void drawOledPage() {
             display.setTextSize(2);
             display.setCursor(8, 4);  display.printf("%.1fF", tempF);
             display.setTextSize(1);
-            display.setCursor(8, 36); display.printf("Air:   %s", getAirQualityLabel(airQuality).c_str());
-            display.setCursor(8, 50); display.printf("Press: %.2f inHg", pressInHg);
+            display.setCursor(8, 36); display.printf("Air:   %s",
+                                      getAirQualityLabel(airQuality).c_str());
+            display.setCursor(8, 48); display.printf("Press: %.2f inHg", pressInHg);
+            display.setCursor(8, 56); display.print(getTimeStamp());
             // -- BITMAP VERSION --
             // display.drawBitmap(4,  12, BITMAP_TEMP_F,     40, 40, WHITE);
-            // display.drawBitmap(88, 12, BITMAP_RH_PERCENT, 40, 40, WHITE);
+            // display.drawBitmap(88, 12, BITMAP_BAROMETER,  40, 40, WHITE);
             // display.setTextSize(1);
             // display.setCursor(50, 16); display.printf("%.1fF", tempF);
             // display.setCursor(50, 32); display.printf("Air: %s", getAirQualityLabel(airQuality).c_str());
@@ -479,10 +553,16 @@ void drawOledPage() {
         }
 
         case PAGE_DEVICES: {
+            // Mister, pump, reservoir status
             display.setTextSize(1);
-            display.setCursor(8, 8);  display.print("-- Devices --");
-            display.setCursor(8, 26); display.printf("Mister: %s", misterRunning ? "ON " : "off");
-            display.setCursor(8, 42); display.printf("Pump:   %s", pumpRunning   ? "ON " : "off");
+            display.setCursor(8, 4);  display.print("-- Devices --");
+            display.setCursor(8, 18); display.printf("Mister:   %s",
+                                      misterRunning ? "ON " : "off");
+            display.setCursor(8, 30); display.printf("Pump:     %s",
+                                      pumpRunning   ? "ON " : "off");
+            display.setCursor(8, 42); display.printf("Reservoir:%s",
+                                      reservoirLow  ? "LOW!" : "OK ");
+            display.setCursor(8, 56); display.print(getTimeStamp());
             // -- BITMAP VERSION --
             // display.drawBitmap(4,  12, BITMAP_MIST, 40, 40, WHITE);
             // display.drawBitmap(84, 12, BITMAP_PUMP, 40, 40, WHITE);
@@ -497,8 +577,11 @@ void drawOledPage() {
             display.setCursor(8, 4);
             display.print(modeAuto ? "AUTO" : "MANUAL");
             display.setTextSize(1);
-            display.setCursor(8, 36); display.print(modeAuto ? "Auto-watering ON" : "Manual mode");
-            display.setCursor(8, 50); display.print("Hold D9 to toggle");
+            display.setCursor(8, 36); display.print(modeAuto
+                                      ? "Auto-watering ON"
+                                      : "Manual mode");
+            display.setCursor(8, 48); display.print("Hold D9 to toggle");
+            display.setCursor(8, 56); display.print(getTimeStamp());
             // -- BITMAP VERSION --
             // const unsigned char* bmp = modeAuto ? BITMAP_AUTO : BITMAP_MANUAL;
             // display.drawBitmap(44, 4, bmp, 40, 40, WHITE);
@@ -511,50 +594,57 @@ void drawOledPage() {
 }
 
 // ─────────────────────────────────────────────
-//  AUTO WATERING WITH HYSTERESIS + MIN ON TIME
+//  AUTO WATERING  (gravel dish sensor)
+//
+//  Hysteresis: ON below GRAVEL_ON_THRESH (500),
+//              OFF above GRAVEL_OFF_THRESH (1500).
+//  Wide gap prevents pump chatter from marginal readings.
+//  Minimum ON time + cooldown protect pump motor.
 // ─────────────────────────────────────────────
-const int SOIL_ON_THRESH  = 30;  // turn pump ON below this
-const int SOIL_OFF_THRESH = 40;  // turn pump OFF above this
-const unsigned long MIN_PUMP_ON_MS = 3000; // minimum ON time
-
 void autoWateringLogic() {
-
     unsigned long now = millis();
 
-    // If pump is currently running, enforce minimum ON time
     if (pumpRunning) {
-        if (now - pumpStartMs < MIN_PUMP_ON_MS) {
-            return; // ignore OFF logic until minimum ON time passes
-        }
-
-        // Only turn off if soil is comfortably above the OFF threshold
-        if (soilPct > SOIL_OFF_THRESH) {
-            Serial.printf("[AUTO] Soil recovered (%d%%) -> stopping pump\n", soilPct);
+        if (now - pumpStartMs < MIN_PUMP_ON_MS) return;
+        if (gravelRaw > SOIL_OFF_THRESH) {
+            Serial.printf("[AUTO] Gravel moist (%d) -> stopping pump\n", gravelRaw);
             stopPump();
+            // Return immediately — pumpStopMs just set, cooldown starts now.
         }
         return;
     }
 
-    // Pump is OFF — check cooldown
+    // Cooldown guard — PUMP_COOLDOWN_MS (60 s) >> SENSOR_INTERVAL_MS (10 s).
+    // This blocks re-trigger even within the same sensor cycle.
     if (now - pumpStopMs < PUMP_COOLDOWN_MS) {
+        Serial.printf("[AUTO] Cooldown: %lu s remaining\n",
+                      (PUMP_COOLDOWN_MS - (now - pumpStopMs)) / 1000);
         return;
     }
 
-    // Turn pump ON only if soil is clearly dry
-    if (soilPct < SOIL_ON_THRESH) {
-        Serial.printf("[AUTO] Soil dry (%d%%) -> starting pump\n", soilPct);
-        startPump();
+    // Floating ADC guard — disconnected sensor reads ~4095.
+    if (gravelRaw >= 4090) {
+        Serial.println("[AUTO] Gravel sensor open circuit -- skipping");
+        return;
+    }
 
+    // Don't run pump dry
+    if (reservoirLow) {
+        Serial.println("[AUTO] Reservoir low -- skipping water cycle");
+        return;
+    }
+
+    if (gravelRaw < SOIL_ON_THRESH) {
+        Serial.printf("[AUTO] Gravel dry (%d) -> starting pump\n", gravelRaw);
+        startPump();
         if (!alertSentThisCycle) {
-            Particle.publish("soil_dry");
+            Particle.publish("soil_dry", String(gravelRaw), PRIVATE);
             alertSentThisCycle = true;
         }
     } else {
-        // Soil is fine — reset alert cycle
         alertSentThisCycle = false;
     }
 }
-
 
 void autoMistingLogic() {
     if (misterRunning) return;
@@ -569,6 +659,10 @@ void autoMistingLogic() {
 // ─────────────────────────────────────────────
 void startPump() {
     if (pumpRunning) return;
+    if (reservoirLow) {
+        Serial.println("[PUMP] Blocked — reservoir low");
+        return;
+    }
     digitalWrite(PUMP_PIN, HIGH);
     pumpRunning = true;
     pumpStartMs = millis();
@@ -579,7 +673,7 @@ void startPump() {
 void stopPump() {
     digitalWrite(PUMP_PIN, LOW);
     pumpRunning = false;
-    pumpStopMs  = millis();  // cooldown starts here
+    pumpStopMs  = millis();
     feedPlantStatus.publish("Pump OFF");
     Serial.println("[PUMP] OFF");
 }
@@ -604,20 +698,15 @@ void stopMister() {
 //  BUTTON HANDLERS
 //
 //  MODE button D9:
-//    Short press < 1 s  -> advance OLED to next page
-//    Long press >= 1 s  -> toggle AUTO / MANUAL mode
+//    Short < 1s  -> advance OLED page
+//    Long  >= 1s -> toggle AUTO / MANUAL, jump to PAGE_MODE
 //
 //  MIST button D7:
-//    Short press < 1 s  -> manual mist burst
-//    Long press >= 1 s  -> manual pump cycle
-//
-//  Edge detection: watch HIGH->LOW (press) to record time,
-//  then LOW->HIGH (release) to measure hold duration.
-//  Non-blocking -- loop() keeps running while button is held.
-//
+//    Short < 1s  -> manual mist burst
+//    Long  >= 1s -> manual pump cycle
 // ─────────────────────────────────────────────
 void handleModeButton() {
-    bool state = digitalRead(MODE_BUTTON_PIN);
+    int state = digitalRead(MODE_BUTTON_PIN);  // int, not bool
 
     if (lastModeButtonState == HIGH && state == LOW) {
         modeButtonPressMs = millis();   // falling edge: record press time
@@ -627,17 +716,15 @@ void handleModeButton() {
         unsigned long held = millis() - modeButtonPressMs;
         if (held > DEBOUNCE_MS) {
             if (held >= 1000) {
-                // Long press -> toggle AUTO / MANUAL
-                modeAuto = !modeAuto;   // ! flips bool: true->false, false->true
+                modeAuto = !modeAuto;
                 feedMode.publish(modeAuto ? "AUTO" : "MANUAL");
-                currentPage = PAGE_MODE; // Force the OLED to the Mode page
-                lastOledMs = millis();   // Reset the timer so it stays here for 5 seconds
-                lastPhysicalModeChangeMs = millis();  // start mode-lock window
+                currentPage = PAGE_MODE;
+                lastOledMs  = millis();
+                lastPhysicalModeChangeMs = millis();
                 Serial.printf("[BTN MODE] -> %s\n", modeAuto ? "AUTO" : "MANUAL");
             } else {
-                // Short press -> next OLED page
                 advancePage();
-                lastOledMs = millis();  // reset auto-advance timer
+                lastOledMs = millis();
                 Serial.println("[BTN MODE] Next page");
             }
         }
@@ -646,23 +733,21 @@ void handleModeButton() {
 }
 
 void handleMistButton() {
-    bool state = digitalRead(MIST_BUTTON_PIN);
+    int state = digitalRead(MIST_BUTTON_PIN);  // int, not bool
 
     if (lastMistButtonState == HIGH && state == LOW) {
-        mistButtonPressMs = millis();   // falling edge: record press time
+        mistButtonPressMs = millis();
     }
 
     if (lastMistButtonState == LOW && state == HIGH) {
         unsigned long held = millis() - mistButtonPressMs;
         if (held > DEBOUNCE_MS) {
             if (held >= 1000) {
-                // Long press -> manual pump cycle
                 startPump();
-                Serial.println("[BTN MIST] Long press -> pump cycle");
+                Serial.println("[BTN MIST] Long -> pump cycle");
             } else {
-                // Short press -> manual mist burst
                 startMister();
-                Serial.println("[BTN MIST] Short press -> mist burst");
+                Serial.println("[BTN MIST] Short -> mist burst");
             }
         }
     }
@@ -672,13 +757,8 @@ void handleMistButton() {
 // ─────────────────────────────────────────────
 //  MQTT SUBSCRIPTIONS
 //
-//  readSubscription(10) listens 10ms for incoming messages.
-//  Returns a pointer to whichever feed sent a message, or
-//  nullptr if nothing arrived. Compared against known feeds.
-//
 //  Mode-lock: dashboard can't override a recent physical button
-//  press for MODE_LOCK_MS milliseconds. Prevents Adafruit IO's
-//  retained last-value from fighting the physical button.
+//  press for MODE_LOCK_MS milliseconds.
 // ─────────────────────────────────────────────
 void handleSubscriptions() {
     Adafruit_MQTT_Subscribe* sub = mqtt.readSubscription(10);
@@ -704,11 +784,10 @@ void handleSubscriptions() {
     }
 
     if (sub == &subModeToggle) {
-        // BUG FIX: mode-lock guard now correctly placed here only.
-        // Dashboard can't override a recent physical button press.
         if (millis() - lastPhysicalModeChangeMs < MODE_LOCK_MS) return;
         String val = String((char*)subModeToggle.lastread);
-        modeAuto = (val == "1" || val.equalsIgnoreCase("AUTO")|| val.equalsIgnoreCase("ON"));
+        modeAuto = (val == "1" || val.equalsIgnoreCase("AUTO")
+                    || val.equalsIgnoreCase("ON"));
         feedMode.publish(modeAuto ? "AUTO" : "MANUAL");
         Serial.printf("[SUB] modetoggle -> %s\n", val.c_str());
     }
@@ -716,28 +795,24 @@ void handleSubscriptions() {
 
 // ─────────────────────────────────────────────
 //  PUBLISH TO ADAFRUIT IO  (every 30 min)
-//
-//  feedPlantStatus carries a rich human-readable summary string --
-//  one feed tells the whole story on the dashboard.
-//  snprintf writes formatted text into a char array (buf),
-//  like Serial.printf but into memory instead of the serial port.
-//  delay(150) respects Adafruit IO free-tier rate limits.
 // ─────────────────────────────────────────────
 void publishToAdafruitIO() {
     if (!mqtt.connected()) return;
 
-    feedTemperature.publish(tempF);                       delay(150);
-    feedHumidity.publish(humidRH);                        delay(150);
-    feedAirReading.publish(airReading);                   delay(150);
-    feedMode.publish(modeAuto ? "AUTO" : "MANUAL");       delay(150);
+    feedTemperature.publish(tempF);                         delay(150);
+    feedHumidity.publish(humidRH);                          delay(150);
+    feedAirReading.publish(airReading);                     delay(150);
+    feedMode.publish(modeAuto ? "AUTO" : "MANUAL");         delay(150);
 
-    // Rich summary string: one feed, full picture
-    char buf[80];
+    char buf[96];
     snprintf(buf, sizeof(buf),
-             "Soil:%s %d%%  Temp:%.1fF  Hum:%.0f%%  Air:%s",
-             (soilPct < SOIL_WATER_THRESH) ? "DRY" : "OK",
-             soilPct, tempF, humidRH,
-             getAirQualityLabel(airQuality).c_str());
+             "Grvl:%d %s  Resv:%s  Tmp:%.1fF  Hum:%.0f%%  Air:%s  %s",
+             gravelRaw,
+             (gravelRaw < GRAVEL_ON_THRESH) ? "DRY" : "OK",
+             reservoirLow ? "LOW!" : "OK",
+             tempF, humidRH,
+             getAirQualityLabel(airQuality).c_str(),
+             getTimeStamp().c_str());
     feedPlantStatus.publish(buf);
 
     Serial.println("[MQTT] Published all feeds.");
@@ -745,14 +820,6 @@ void publishToAdafruitIO() {
 
 // ─────────────────────────────────────────────
 //  MQTT CONNECT / PING
-//
-//  MQTT_connect(): 3-try limit -- more robust than "try once"
-//  but doesn't hang forever if the router is down.
-//  After 3 failures it moves on; next loop() call tries again.
-//  This is the sweet spot between your "if" and a blocking "while".
-//
-//  MQTT_ping(): keepalive every 2 min. 'static' means lastPing
-//  remembers its value between calls -- not reset each time.
 // ─────────────────────────────────────────────
 void MQTT_connect() {
     int8_t  ret;
@@ -777,7 +844,6 @@ bool MQTT_ping() {
     static unsigned long lastPing = 0;
     bool status = true;
     if (millis() - lastPing > 120000) {
-        Serial.println("Pinging MQTT...");
         status = mqtt.ping();
         if (!status) {
             Serial.println("Ping failed -- disconnecting");
@@ -789,24 +855,12 @@ bool MQTT_ping() {
 }
 
 // ─────────────────────────────────────────────
-//  NEOPIXEL ANIMATION
+//  NEOPIXEL ANIMATION  (single 12-LED ring)
 //
 //  Priority: mist sparkle > pump chase > manual gold
 //            > dry red pulse > idle rainbow breathe
 //
-//  Sine wave brightness creates the "breathing" effect:
-//    sin() returns -1.0 to +1.0
-//    x 20 + 30 gives range 10 to 50 (gentle idle breathe)
-//    x 60 + 80 gives range 20 to 140 (stronger dry pulse)
-//  Same concept as: brightness = 127.5 * sin(2*PI*f*t) + 127.5
-//  just scaled to a smaller range.
-//
-//  Idle rainbow extracts R,G,B from packed uint32_t color:
-//    >> 16 shifts red byte into position, & 0xFF isolates it
-//    >> 8  shifts green, & 0xFF isolates it
-//    & 0xFF isolates blue in place
-//  Then each channel is scaled by brightness/255.
-//  No ColorHSV needed -- compatible with all library versions.
+//  Uses Colors.h
 // ─────────────────────────────────────────────
 void updateNeoPixel() {
     static uint8_t  step = 0;
@@ -814,7 +868,6 @@ void updateNeoPixel() {
     pixel.clear();
 
     if (misterRunning) {
-        // Cyan sparkle -- different pixels light each tick
         for (int i = 0; i < PIXEL_COUNT; i++) {
             pixel.setPixelColor((i + step) % PIXEL_COUNT,
                                 pixel.Color(0, 160 + (step * 3 % 60), 180));
@@ -822,7 +875,6 @@ void updateNeoPixel() {
         step = (step + 3) % PIXEL_COUNT;
 
     } else if (pumpRunning) {
-        // Green 4-pixel chase around the ring
         for (int i = 0; i < 4; i++) {
             pixel.setPixelColor((step + i) % PIXEL_COUNT,
                                 pixel.Color(0, 200, 60));
@@ -830,13 +882,12 @@ void updateNeoPixel() {
         step = (step + 1) % PIXEL_COUNT;
 
     } else if (!modeAuto) {
-        // Solid warm gold -- manual mode indicator
         for (int i = 0; i < PIXEL_COUNT; i++) {
             pixel.setPixelColor(i, pixel.Color(180, 140, 0));
         }
 
-    } else if (soilPct < SOIL_WATER_THRESH) {
-        // Red slow pulse -- dry alert
+    } else if (gravelRaw < GRAVEL_ON_THRESH) {
+        // Red pulse — gravel dry alert
         uint8_t bright = (uint8_t)(80 + 60 * sin(step * 0.15f));
         for (int i = 0; i < PIXEL_COUNT; i++) {
             pixel.setPixelColor(i, pixel.Color(bright, 0, 0));
@@ -860,26 +911,4 @@ void updateNeoPixel() {
     pixel.show();
 }
 
-void drawDisplay(String timeOnly) {
-  display.clearDisplay(); // Clear the display buffer
-  display.setTextSize(1); // Set text size to 1 (6px high)
-  display.setTextColor(WHITE); // Set text color to white
-  display.setCursor(0,0); // Set cursor to top-left corner
-  display.println("Moisture Level:"); // Print label for moisture level
-  display.setCursor(0,10); // Move cursor down to next line
-  display.print(soilPct); // Print moisture level to OLED display
-  display.setCursor(0,20); // Move cursor down to next line
-  display.print(timeOnly); // Print time and date label
-  display.display(); // Update the display with the new moisture level  
-}
-
-String timeStamp() {
-  //Particle.syncTime(); //Sync time with Particle Cloud
-  String dateTime = Time.timeStr(); // Get current date and time as a string
-  String timeOnly = dateTime.substring(11,19); // Extract the time from the
-  dateTime = Time.timeStr(); //Current Date and Time from Particle Time class
-  timeOnly = dateTime.substring(11,19); //Extract the Time from the DateTime String
-  return timeOnly; // Return the time as a string for the time-stamp; 
-}
-
-// -- End of plantMonitor.cpp --------------------
+// ── End of plantMonitor.cpp ──────────────────
