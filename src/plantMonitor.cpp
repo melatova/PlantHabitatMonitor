@@ -22,6 +22,8 @@
 //  Adafruit IO feeds:
 //    PUBLISH  -> temperature, humidity, plant-status, airreading, mode
 //    SUBSCRIBE<- pumponoff, misteronoff, modetoggle
+
+//   Zapier       (email/SMS webhooks via Particle.publish)
 //
 //  Future: reservoir level feed, SMS alert, OLED bitmap graphics
 // ============================================================
